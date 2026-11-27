@@ -12,10 +12,47 @@ ROOT = Path(__file__).resolve().parents[1]
 MODEL = ROOT / "models" / "hand_landmarker.task"
 
 
-def run_camera(stop, publish=None, preview=False, evaluate=False, publish_frame=None):
+def open_camera(cv2, index, webcam):
+    if webcam:
+        camera = cv2.VideoCapture(index)
+        if not camera.isOpened():
+            camera.release()
+            raise RuntimeError(f"Could not open webcam {index}. Try --camera-index 1 or close other camera apps.")
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+        def capture():
+            ready, frame = camera.read()
+            if not ready:
+                raise RuntimeError(f"Could not read webcam {index}. Check the camera connection and access.")
+            return frame
+
+        return capture, camera.release
+
+    from picamera2 import Picamera2
+
+    camera = Picamera2(camera_num=index)
+    try:
+        # RGB888 yields a BGR array in Picamera2. MediaPipe needs RGB.
+        camera.configure(camera.create_video_configuration(
+            main={"size": (640, 480), "format": "RGB888"},
+            controls={"FrameRate": 25},
+        ))
+        camera.start()
+    except BaseException:
+        camera.close()
+        raise
+    return camera.capture_array, camera.close
+
+
+def run_camera(stop, publish=None, preview=False, evaluate=False, publish_frame=None, *,
+               publish_snapshot=None, webcam=False, camera_index=None):
     import cv2
     import mediapipe as mp
-    from picamera2 import Picamera2
+
+    if not MODEL.is_file():
+        raise RuntimeError(f"Missing MediaPipe model at {MODEL}. Download it using the README instructions.")
+    index = int(os.environ.get("CAMERA_INDEX", "0")) if camera_index is None else camera_index
 
     options = mp.tasks.vision.HandLandmarkerOptions(
         base_options=mp.tasks.BaseOptions(model_asset_path=str(MODEL)),
@@ -36,20 +73,15 @@ def run_camera(stop, publish=None, preview=False, evaluate=False, publish_frame=
     last_ms = -1
     last_telemetry = 0
     next_web_frame = 0
+    next_snapshot = 0
     last_command = "Waiting"
 
     with mp.tasks.vision.HandLandmarker.create_from_options(options) as landmarker:
-        camera = Picamera2(camera_num=int(os.environ.get("CAMERA_INDEX", "0")))
+        capture, close_camera = open_camera(cv2, index, webcam)
         try:
-            # RGB888 yields a BGR array in Picamera2. MediaPipe needs RGB.
-            camera.configure(camera.create_video_configuration(
-                main={"size": (640, 480), "format": "RGB888"},
-                controls={"FrameRate": 25},
-            ))
-            camera.start()
             started = time.monotonic()
             while not stop.is_set():
-                bgr = camera.capture_array()
+                bgr = capture()
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 now = time.monotonic()
                 last_ms = max(last_ms + 1, int((now - started) * 1000))
@@ -74,6 +106,11 @@ def run_camera(stop, publish=None, preview=False, evaluate=False, publish_frame=
                         LOG.info("Gesture %s requested %s (local publish queued: %s)", label, command, sent)
 
                 web_frame_due = publish_frame is not None and now >= next_web_frame
+                if publish_snapshot is not None and now >= next_snapshot:
+                    next_snapshot = now + 0.5
+                    ready, jpeg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                    if ready:
+                        publish_snapshot(jpeg.tobytes())
                 if not (preview or web_frame_due):
                     continue
                 height, width = bgr.shape[:2]
@@ -110,7 +147,7 @@ def run_camera(stop, publish=None, preview=False, evaluate=False, publish_frame=
                             writer.writerow(["image", "expected", "detected", "fps"])
                         writer.writerow([sample, expected, label, round(fps, 2)])
         finally:
-            camera.close()
+            close_camera()
             if preview:
                 cv2.destroyAllWindows()
             if evaluate and attempts:

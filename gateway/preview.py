@@ -1,11 +1,14 @@
-"""Read-only camera and telemetry preview. Bind to loopback by default."""
+"""Camera and telemetry preview with an optional on-demand camera check."""
 
 import json
 import logging
+import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from .camera_check import CameraCheckError
 from .hand import HOLD_SECONDS
 from .history import RANGES, metrics_text, query_history
 
@@ -36,7 +39,10 @@ PAGE = """<!doctype html>
   .connection { margin: 6px 0 0; font-size: .9rem; }
   .readings dt { color: #aec3c6; font-size: .84rem; }
   .readings dd { font-variant-numeric: tabular-nums; font-size: 1.1rem; }
-  .history { margin-top: 24px; padding: 18px; border: 1px solid #2c444b; border-radius: 14px; background: #101d24; }
+  .history, .camera-check { margin-top: 24px; padding: 18px; border: 1px solid #2c444b; border-radius: 14px; background: #101d24; }
+  .camera-check p { margin: 8px 0; }
+  .camera-check button { font: inherit; font-weight: 650; color: #0c141a; background: #8ce5cb; border: 0; border-radius: 6px; padding: 8px 12px; cursor: pointer; }
+  .camera-check button:disabled { opacity: .6; cursor: default; }
   .history-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
   .history-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: .9rem; }
   select { font: inherit; color: inherit; background: #14232a; border: 1px solid #47626a; border-radius: 6px; padding: 6px; }
@@ -60,6 +66,12 @@ PAGE = """<!doctype html>
         <div><dt>Closed fist</dt><dd>@@HOLD@@ s &middot; OFF request</dd></div>
       </dl>
       <p>Keep one full hand in view. To change commands, switch poses and hold the new pose steady.</p>
+      <section class="camera-check" aria-labelledby="camera-check-title">
+        <h2 id="camera-check-title">AI Camera Check</h2>
+        <p>Send one camera snapshot to Google Gemini for framing and lighting feedback.</p>
+        <button type="button" id="check-camera" data-token="@@CHECK_TOKEN@@" @@CHECK_DISABLED@@>Check camera frame</button>
+        <p id="camera-check-status" role="status">@@CHECK_STATUS@@</p>
+      </section>
     </section>
     <section id="telemetry" @@TELEMETRY_HIDDEN@@ aria-labelledby="telemetry-title">
       <h2 id="telemetry-title">Live sensor readings</h2>
@@ -113,6 +125,28 @@ PAGE = """<!doctype html>
   const sensor = (value, unit, digits = 0) =>
     value >= 0 ? number(value, unit, digits) : "—";
   const flag = (value, on, off) => value === 1 ? on : value === 0 ? off : "—";
+
+  const checkCamera = document.getElementById("check-camera");
+  checkCamera.addEventListener("click", async () => {
+    checkCamera.disabled = true;
+    set("camera-check-status", "Checking the snapshot…");
+    try {
+      const response = await fetch("/api/camera-check", {
+        method: "POST", headers: {"X-Camera-Check": checkCamera.dataset.token},
+        signal: AbortSignal.timeout(22000)
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        set("camera-check-status", result.error || "Camera check failed. Try again.");
+        return;
+      }
+      set("camera-check-status", `${result.feedback} · Gemini · ${(result.elapsed_ms / 1000).toFixed(1)} s`);
+    } catch (error) {
+      set("camera-check-status", "Camera check could not finish. Try again.");
+    } finally {
+      checkCamera.disabled = false;
+    }
+  });
 
   function show(readings) {
     set("temperature", number(readings.Temperature, " °C", 1));
@@ -247,15 +281,23 @@ PAGE = """<!doctype html>
 
 
 class WebPreview:
-    def __init__(self, host="127.0.0.1", port=8080, *, camera_only=False, read_status=None):
+    def __init__(self, host="127.0.0.1", port=8080, *, camera_only=False, read_status=None,
+                 camera_check=None):
         self.address = (host, port)
         self.read_status = read_status
-        mode = ("Camera-only test. Gesture requests are shown on the video."
+        self.camera_check = camera_check
+        self.check_token = secrets.token_urlsafe(24) if camera_check else ""
+        self.check_lock = threading.Lock()
+        self.snapshot = None
+        mode = ("Camera test. Gesture requests are shown on the video."
                 if camera_only else "Live camera and MQTT readings from the Raspberry Pi gateway.")
         self.page = (PAGE.replace("@@MODE@@", mode)
                      .replace("@@HOLD@@", f"{HOLD_SECONDS:g}")
                      .replace("@@LAYOUT@@", "camera-only" if camera_only else "")
                      .replace("@@TELEMETRY_HIDDEN@@", "hidden" if camera_only else "")
+                     .replace("@@CHECK_TOKEN@@", self.check_token)
+                     .replace("@@CHECK_DISABLED@@", "" if camera_check else "disabled")
+                     .replace("@@CHECK_STATUS@@", "" if camera_check else "Set GEMINI_API_KEY in .env to enable this check.")
                      .encode("utf-8"))
         self.condition = threading.Condition()
         self.sequence = 0
@@ -292,6 +334,33 @@ class WebPreview:
                     self.stream_video()
                 else:
                     self.send_error(404)
+
+            def do_POST(self):
+                if self.path != "/api/camera-check":
+                    self.send_error(404)
+                    return
+                if preview.camera_check is None:
+                    self.send_json({"error": "Set GEMINI_API_KEY in .env to enable this check."}, status=503)
+                    return
+                host = self.headers.get("Host", "").split(":", 1)[0].lower()
+                if ((preview.address[0] == "127.0.0.1" and host not in ("127.0.0.1", "localhost"))
+                        or self.headers.get("X-Camera-Check") != preview.check_token):
+                    self.send_json({"error": "Open the local preview and use the Camera Check button."}, status=403)
+                    return
+                with preview.condition:
+                    snapshot = preview.snapshot
+                if snapshot is None or time.monotonic() - snapshot[1] > 3:
+                    self.send_json({"error": "Waiting for a fresh camera frame. Try again shortly."}, status=503)
+                    return
+                if not preview.check_lock.acquire(blocking=False):
+                    self.send_json({"error": "A camera check is already running. Try again shortly."}, status=429)
+                    return
+                try:
+                    self.send_json(preview.camera_check(snapshot[0]))
+                except CameraCheckError as exc:
+                    self.send_json({"error": str(exc)}, status=502)
+                finally:
+                    preview.check_lock.release()
 
             def send_json(self, payload, status=200):
                 body = json.dumps(payload, allow_nan=False).encode("utf-8")
@@ -340,6 +409,10 @@ class WebPreview:
             self.sequence += 1
             self.frame = jpeg
             self.condition.notify_all()
+
+    def publish_snapshot(self, jpeg):
+        with self.condition:
+            self.snapshot = (jpeg, time.monotonic())
 
     def __exit__(self, *exc):
         with self.condition:

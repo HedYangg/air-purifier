@@ -10,8 +10,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .bridge import Bridge
 from .camera import run_camera
+from .camera_check import configured_checker
 from .preview import WebPreview
 
 LOG = logging.getLogger(__name__)
@@ -50,18 +50,22 @@ def retry_worker(stop, callback):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pi 5 air purifier gateway")
+    parser = argparse.ArgumentParser(description="Air purifier gateway and camera preview")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--preview", action="store_true", help="Show camera landmarks on the Pi display")
     mode.add_argument("--no-camera", action="store_true", help="Start monitoring without gestures")
     mode.add_argument("--evaluate", action="store_true", help="Capture evaluation trials with MQTT disabled")
     mode.add_argument("--web-preview", action="store_true", help="Serve a browser preview on port 8080")
+    mode.add_argument("--laptop", action="store_true", help="Test a webcam and the AI camera check locally")
     parser.add_argument("--camera-only", action="store_true", help="Test the browser preview without MQTT or KY-015")
+    parser.add_argument("--camera-index", type=int, help="Select a camera index (defaults to CAMERA_INDEX or 0)")
     parser.add_argument("--web-host", choices=("127.0.0.1", "0.0.0.0"), default="127.0.0.1",
                         help="Bind the preview locally or to a trusted LAN")
     args = parser.parse_args()
     if (args.camera_only or args.web_host != "127.0.0.1") and not args.web_preview:
         parser.error("--camera-only and --web-host require --web-preview")
+    if args.camera_index is not None and args.camera_index < 0:
+        parser.error("--camera-index must be nonnegative")
     load_dotenv(Path(__file__).resolve().parents[1] / ".env")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     stop = threading.Event()
@@ -69,17 +73,21 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     if args.evaluate:
         LOG.info("Label trials with o=open palm, f=fist, n=no hand, x=other. q=finish.")
-        run_camera(stop, preview=True, evaluate=True)
+        run_camera(stop, preview=True, evaluate=True, camera_index=args.camera_index)
         return
 
-    if args.camera_only:
-        with WebPreview(args.web_host, camera_only=True) as web:
-            run_camera(stop, publish_frame=web.publish)
+    if args.laptop or args.camera_only:
+        checker = configured_checker()
+        with WebPreview(args.web_host, camera_only=True, camera_check=checker) as web:
+            run_camera(stop, publish_frame=web.publish, webcam=args.laptop, camera_index=args.camera_index,
+                       publish_snapshot=web.publish_snapshot if checker is not None else None)
         return
     run_gateway(stop, args)
 
 
 def run_gateway(stop, args):
+    from .bridge import Bridge
+
     token = os.environ.get("BLYNK_TOKEN", "")
     cloud_host = os.environ.get("BLYNK_HOST", "sgp1.blynk.cloud").lower()
     if token and (not cloud_host.endswith(".blynk.cloud") or "/" in cloud_host):
@@ -113,7 +121,8 @@ def run_gateway(stop, args):
         }
 
     workers.append(threading.Thread(target=cloud_loop, name="blynk", daemon=True))
-    preview = WebPreview(args.web_host, read_status=read_status) if args.web_preview else nullcontext()
+    checker = configured_checker() if args.web_preview else None
+    preview = WebPreview(args.web_host, read_status=read_status, camera_check=checker) if args.web_preview else nullcontext()
     with preview as web:
         bridge.start()
         for worker in workers:
@@ -123,7 +132,9 @@ def run_gateway(stop, args):
                 stop.wait()
             else:
                 retry_worker(stop, lambda: run_camera(
-                    stop, bridge.publish_local, args.preview, publish_frame=web.publish if web else None))
+                    stop, bridge.publish_local, args.preview, camera_index=args.camera_index,
+                    publish_frame=web.publish if web else None,
+                    publish_snapshot=web.publish_snapshot if checker is not None else None))
         finally:
             stop.set()
             for worker in workers:

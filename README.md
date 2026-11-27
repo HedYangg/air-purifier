@@ -11,7 +11,7 @@ Open [the three-page wiring diagram](docs/wiring.drawio) in Draw.io Desktop or d
 | Prometheus on the Pi | On-disk time-series database for the gateway's numeric IoT readings |
 | Blynk.Cloud | Live dashboard and history charts for the configured datastreams |
 
-The ESP32 sends telemetry to Mosquitto on the Pi over Wi-Fi. The Pi reads the camera and KY-015 locally, publishes their data to Mosquitto, and forwards the latest readings to Blynk via MQTT over TLS. Gesture commands travel back from the Pi to the ESP32 via local MQTT. Camera frames stay on the Pi. Internet access is only needed for Blynk during operation.
+The ESP32 sends telemetry to Mosquitto on the Pi over Wi-Fi. The Pi reads the camera and KY-015 locally, publishes their data to Mosquitto, and forwards the latest readings to Blynk via MQTT over TLS. Gesture commands travel back from the Pi to the ESP32 via local MQTT. MediaPipe processes the live camera feed locally. The optional AI Camera Check sends a single snapshot to Gemini on request. Blynk and Gemini require internet access.
 
 The dashboard shows **Gas response (MQ-135)** as millivolts measured at ESP32-S3 GPIO4 after the divider. After the sensor warms up, compare readings over time under similar temperature and humidity. The sensor responds to multiple substances, including ammonia and some solvent vapors. A change in voltage alone cannot identify the gas, determine CO₂ concentration, or provide an Air Quality Index. [Winsen MQ-135 manual](https://www.winsen-sensor.com/manual/mq135.html?lang=en)
 
@@ -118,6 +118,33 @@ On a trusted local network you can instead add `--web-host 0.0.0.0` and open `ht
 When Mosquitto is configured, omit `--camera-only` to run the full gateway and browser preview in the same process. The preview shows temperature, humidity, PM2.5, MQ-135 gas response in millivolts, both tilt angles, motion, fan relay, safety lock, and the MQTT, ESP32, and Blynk connection states. The values refresh from the Pi's local MQTT readings even if Blynk is disabled. A dash means there is no current valid reading. The fan card shows Dry run while the firmware's relay output is disabled.
 
 Omit `--web-preview` for regular operation without video in a browser. The gateway must run while you want gestures and Blynk updates. Closing the preview tab leaves the gateway running.
+
+#### AI Camera Check and laptop mode
+
+The **AI Camera Check** button sends one current camera snapshot to Gemini for feedback on hand visibility, framing, light, or blur. The preview shows the feedback and the request time. MediaPipe runs continuously on the device and handles gesture recognition. A Gemini request runs when you press **Check camera frame**.
+
+Create a [Gemini API key](https://aistudio.google.com/apikey) and set `GEMINI_API_KEY` in the project's `.env`. `GEMINI_MODEL` defaults to `gemini-3.1-flash-lite`. Keep the `.env` file local. On the Pi, restart the gateway with your usual `--web-preview` command to enable the button. [Gemini image understanding](https://ai.google.dev/gemini-api/docs/image-understanding)
+
+On a Windows laptop, open PowerShell in the project folder and run the following with Python 3.12 installed.
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-laptop.txt
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+notepad .env
+```
+
+Save `GEMINI_API_KEY` in `.env`, then download the hand landmark model if it is missing and start the webcam preview.
+
+```powershell
+if (-not (Test-Path models/hand_landmarker.task)) {
+    New-Item -ItemType Directory -Path models -Force | Out-Null
+    curl.exe -fL 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task' -o models/hand_landmarker.task
+}
+.\.venv\Scripts\python.exe -m gateway.run --laptop
+```
+
+Open [the laptop preview](http://127.0.0.1:8080). Laptop mode starts the webcam, local MediaPipe tracking, and the optional Gemini check. It requires no Raspberry Pi, ESP32, MQTT broker, Blynk connection, or Prometheus database. The webcam and gesture preview also work while the API key field is empty. If Windows picks the wrong camera, restart with `--laptop --camera-index 1`. Press **Ctrl+C** to stop the preview.
 
 #### Store and view sensor history on the Pi
 

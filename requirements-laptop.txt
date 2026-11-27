@@ -1,0 +1,3 @@
+# MediaPipe installs the OpenCV package used by the webcam preview.
+mediapipe==1.2.3
+python-dotenv>=1.0,<2
