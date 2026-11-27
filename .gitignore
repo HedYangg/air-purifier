@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.task
+arduino/air_node/config.h
+evaluation/
+.checks/
+*.exe

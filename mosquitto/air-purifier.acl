@@ -1,0 +1,9 @@
+user air-node
+topic write air/node/#
+topic read air/camera/command
+
+user air-gateway
+topic read air/node/#
+topic readwrite air/gateway/#
+topic readwrite air/camera/gesture
+topic write air/camera/command
