@@ -8,8 +8,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from .camera_check import CameraCheckError
-from .hand import HOLD_SECONDS
+from .camera_check import CameraCheckError, GESTURE_TARGETS, describe_observation
+from .hand import HOLD_SECONDS, OPEN_PALM
 from .history import RANGES, metrics_text, query_history
 
 LOG = logging.getLogger(__name__)
@@ -68,8 +68,15 @@ PAGE = """<!doctype html>
       <p>Keep one full hand in view. To change commands, switch poses and hold the new pose steady.</p>
       <section class="camera-check" aria-labelledby="camera-check-title">
         <h2 id="camera-check-title">AI Camera Check</h2>
-        <p>Send one camera snapshot to Google Gemini for framing and lighting feedback.</p>
+        <p>Choose your gesture and send one snapshot to Google Gemini for a pose or framing tip.</p>
+        <label>Gesture to check
+          <select id="camera-check-target" @@CHECK_DISABLED@@>
+            <option value="OPEN_PALM">Open palm</option>
+            <option value="FIST">Closed fist</option>
+          </select>
+        </label>
         <button type="button" id="check-camera" data-token="@@CHECK_TOKEN@@" @@CHECK_DISABLED@@>Check camera frame</button>
+        <p id="camera-check-local" aria-live="polite" hidden></p>
         <p id="camera-check-status" role="status">@@CHECK_STATUS@@</p>
       </section>
     </section>
@@ -127,15 +134,24 @@ PAGE = """<!doctype html>
   const flag = (value, on, off) => value === 1 ? on : value === 0 ? off : "—";
 
   const checkCamera = document.getElementById("check-camera");
+  const checkTarget = document.getElementById("camera-check-target");
+  const checkLocal = document.getElementById("camera-check-local");
   checkCamera.addEventListener("click", async () => {
     checkCamera.disabled = true;
+    checkTarget.disabled = true;
+    checkLocal.hidden = true;
     set("camera-check-status", "Checking the snapshot…");
     try {
       const response = await fetch("/api/camera-check", {
-        method: "POST", headers: {"X-Camera-Check": checkCamera.dataset.token},
+        method: "POST",
+        headers: {"X-Camera-Check": checkCamera.dataset.token, "X-Gesture-Target": checkTarget.value},
         signal: AbortSignal.timeout(22000)
       });
       const result = await response.json();
+      if (result.local_feedback) {
+        checkLocal.textContent = result.local_feedback;
+        checkLocal.hidden = false;
+      }
       if (!response.ok) {
         set("camera-check-status", result.error || "Camera check failed. Try again.");
         return;
@@ -145,6 +161,7 @@ PAGE = """<!doctype html>
       set("camera-check-status", "Camera check could not finish. Try again.");
     } finally {
       checkCamera.disabled = false;
+      checkTarget.disabled = false;
     }
   });
 
@@ -347,6 +364,10 @@ class WebPreview:
                         or self.headers.get("X-Camera-Check") != preview.check_token):
                     self.send_json({"error": "Open the local preview and use the Camera Check button."}, status=403)
                     return
+                target = self.headers.get("X-Gesture-Target", OPEN_PALM)
+                if target not in GESTURE_TARGETS:
+                    self.send_json({"error": "Choose open palm or closed fist."}, status=400)
+                    return
                 with preview.condition:
                     snapshot = preview.snapshot
                 if snapshot is None or time.monotonic() - snapshot[1] > 3:
@@ -355,10 +376,13 @@ class WebPreview:
                 if not preview.check_lock.acquire(blocking=False):
                     self.send_json({"error": "A camera check is already running. Try again shortly."}, status=429)
                     return
+                jpeg, _, observation = snapshot
                 try:
-                    self.send_json(preview.camera_check(snapshot[0]))
+                    local_feedback = describe_observation(target, observation)
+                    result = preview.camera_check(jpeg, target=target, local_feedback=local_feedback)
+                    self.send_json({**result, "local_feedback": local_feedback})
                 except CameraCheckError as exc:
-                    self.send_json({"error": str(exc)}, status=502)
+                    self.send_json({"error": str(exc), "local_feedback": local_feedback}, status=502)
                 finally:
                     preview.check_lock.release()
 
@@ -410,9 +434,9 @@ class WebPreview:
             self.frame = jpeg
             self.condition.notify_all()
 
-    def publish_snapshot(self, jpeg):
+    def publish_snapshot(self, jpeg, observation):
         with self.condition:
-            self.snapshot = (jpeg, time.monotonic())
+            self.snapshot = (jpeg, time.monotonic(), observation)
 
     def __exit__(self, *exc):
         with self.condition:

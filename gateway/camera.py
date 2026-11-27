@@ -110,7 +110,11 @@ def run_camera(stop, publish=None, preview=False, evaluate=False, publish_frame=
                     next_snapshot = now + 0.5
                     ready, jpeg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 75])
                     if ready:
-                        publish_snapshot(jpeg.tobytes())
+                        publish_snapshot(jpeg.tobytes(), {
+                            "gesture": label,
+                            "hand_count": len(hands),
+                            "request_generated": gate.last_emitted == label,
+                        })
                 if not (preview or web_frame_due):
                     continue
                 height, width = bgr.shape[:2]

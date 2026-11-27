@@ -121,7 +121,7 @@ Omit `--web-preview` for regular operation without video in a browser. The gatew
 
 #### AI Camera Check and laptop mode
 
-The **AI Camera Check** button sends one current camera snapshot to Gemini for feedback on hand visibility, framing, light, or blur. The preview shows the feedback and the request time. MediaPipe runs continuously on the device and handles gesture recognition. A Gemini request runs when you press **Check camera frame**.
+Under **AI Camera Check**, select **Open palm** or **Closed fist** and press **Check camera frame** while holding the pose. The gateway sends one current snapshot to Gemini for a tip about visible issues such as bent fingers, a tucked thumb, an edge-on hand, cropping, or lighting. The preview shows the MediaPipe result from the same snapshot alongside Gemini's suggestion and response time. MediaPipe runs continuously on the device and handles gesture recognition and the three-second hold.
 
 Create a [Gemini API key](https://aistudio.google.com/apikey) and set `GEMINI_API_KEY` in the project's `.env`. `GEMINI_MODEL` defaults to `gemini-3.1-flash-lite`. Keep the `.env` file local. On the Pi, restart the gateway with your usual `--web-preview` command to enable the button. [Gemini image understanding](https://ai.google.dev/gemini-api/docs/image-understanding)
 
